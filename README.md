@@ -1,9 +1,9 @@
 message_load_benchmark
 =====
 
-An OTP application
+A benchmark that measures the throughput and latency of Erlang message passing.
 
-Build
+Usage
 -----
 
     $ erlc message_load_benchmark.erl
