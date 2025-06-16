@@ -9,10 +9,6 @@
 -define(WorkerReceiveWait, 10).
 
 start() ->
-    ets:new(?MODULE, [public, named_table]),
-    ets:insert(?MODULE, {diff, 0, 0}),
-    ets:insert(?MODULE, {flush, 0}),
-
     io:format("Starting ~p processes~n", [?NumProcesses]),
     Pids = do_start(?NumProcesses, []),
     Map = maps:from_list(Pids),
@@ -29,13 +25,18 @@ start() ->
     timer:sleep(?CollectPeriod),
 
     io:format("Stopping test~n~n", []),
-    [ erlang:send(Pid, stop) || {_, Pid} <- Pids ],
+    Self = self(),
+    DataRefs = [ begin
+          Ref = make_ref(),
+          erlang:send(Pid, {stop, Self, Ref}),
+          Ref
+      end || {_, Pid} <- Pids ],
+    Data = receive_data(DataRefs, []),
     receive_downs(M),
-    print_report().
+    print_report(Data).
 
-print_report() ->
-    [{diff, USum, NS}] = ets:lookup(?MODULE, diff),
-    [{flush, NF}] = ets:lookup(?MODULE, flush),
+print_report(Data) ->
+    {USum, NS, NF} = lists:foldl(fun({Si, Ti, Fi}, {S, T, F}) -> {S+Si, T+Ti, F+Fi} end, {0, 0, 0}, Data),
 
     io:format("== System ==~n"),
     io:format("~n"),
@@ -66,41 +67,41 @@ print_system(_) ->
 do_start(0, Acc) ->
     Acc;
 do_start(N, Acc) ->
-    Pid = spawn_link(fun() -> worker_loop(idle, nocollect) end),
+    Pid = spawn_link(fun() -> worker_loop(idle, nocollect, {0,0,0}) end),
     do_start(N-1, [{N, Pid}|Acc]).
 
-worker_loop(idle, Collect) ->
+worker_loop(idle, Collect, Data) ->
     receive
         start ->
-            worker_loop(start, Collect);
+            worker_loop(start, Collect, Data);
         stop ->
             ok;
         collect ->
-            worker_loop(idle, collect);
+            worker_loop(idle, collect, Data);
         {Ref, T1} when is_reference(Ref) ->
             T2 = erlang:monotonic_time(?TimeUnit),
-            receive_message(Ref, T1, T2, Collect),
-            worker_loop(idle, Collect)
+            Data2 = receive_message(Ref, T1, T2, Collect, Data),
+            worker_loop(idle, Collect, Data2)
     end;
-worker_loop(start, Collect) ->
+worker_loop(start, Collect, Data) ->
     case select_target() of
         Target when is_pid(Target) ->
             erlang:send_nosuspend(Target, {make_ref(), erlang:monotonic_time(?TimeUnit)});
         _ ->
             ok
     end,
-    worker_flush(Collect),
+    Data2 = worker_flush(Collect, Data),
     receive
-        stop ->
-            ok;
+        {stop, Recv, Ref} ->
+            erlang:send(Recv, {Ref, Data});
         collect ->
-            worker_loop(start, collect);
+            worker_loop(start, collect, Data2);
         {Ref, T1} when is_reference(Ref) ->
             T2 = erlang:monotonic_time(?TimeUnit),
-            receive_message(Ref, T1, T2, Collect),
-            worker_loop(start, Collect)
+            Data3 = receive_message(Ref, T1, T2, Collect, Data2),
+            worker_loop(start, Collect, Data3)
     after ?WorkerReceiveWait ->
-        worker_loop(start, Collect)
+        worker_loop(start, Collect, Data2)
     end.
 
 select_target() ->
@@ -116,18 +117,18 @@ select_target() ->
             Pid
     end.
 
-receive_message(_Ref, T1, T2, Collect) ->
+receive_message(_Ref, T1, T2, Collect, Data) ->
     case process_info(self(), message_queue_len) of
         {message_queue_len, 0} ->
             Diff = T2 - T1,
-            collect_diff(Diff, Collect);
+            collect_diff(Diff, Collect, Data);
         _ ->
-            worker_flush(Collect)
+            worker_flush(Collect, Data)
     end.
 
-worker_flush(Collect) ->
+worker_flush(Collect, Data) ->
     Flushed = do_worker_flush(0),
-    collect_flush(Flushed, Collect).
+    collect_flush(Flushed, Collect, Data).
 
 do_worker_flush(N) ->
     receive
@@ -135,6 +136,14 @@ do_worker_flush(N) ->
             do_worker_flush(N+1)
     after 0 ->
               N
+    end.
+
+receive_data([], Acc) ->
+    Acc;
+receive_data([Ref|Refs], Acc) ->
+    receive
+        {Ref, DataItem} ->
+            receive_data(Refs, [DataItem|Acc])
     end.
 
 receive_downs([]) ->
@@ -145,12 +154,13 @@ receive_downs([M|Rest]) ->
             receive_downs(Rest)
     end.
 
-collect_diff(_Diff, nocollect) ->
-    ok;
-collect_diff(Diff, collect) ->
-    ets:update_counter(?MODULE, diff, [{2, Diff}, {3, 1}]).
+collect_diff(_Diff, nocollect, Data) ->
+    Data;
+collect_diff(Diff, collect, Data={S,T,_}) ->
+    Data2 = erlang:setelement(1, Data, S+Diff),
+    erlang:setelement(2, Data2, T+1).
 
-collect_flush(_Flushed, nocollect) ->
-    ok;
-collect_flush(Flushed, collect) ->
-    ets:update_counter(?MODULE, flush, [{2, Flushed}]).
+collect_flush(_Flushed, nocollect, Data) ->
+    Data;
+collect_flush(Flushed, collect, Data={_,_,F}) ->
+    erlang:setelement(3, Data, F+Flushed).
